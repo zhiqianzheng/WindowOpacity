@@ -29,6 +29,7 @@ static HWND mainWindow, windowList, slider, percentEdit, statusText, pickButton;
 static HFONT font, headingFont;
 static HWND target;
 static std::vector<SavedWindow> saved;
+static std::vector<SavedWindow> temporaryOpacity;
 static int countdown;
 static double scale = 1;
 static const wchar_t* propertyName = L"WindowOpacity.Owner.8CF3470F";
@@ -36,10 +37,11 @@ static HANDLE ownerToken;
 enum { TrayCallback = WM_APP + 1, WheelMessage = WM_APP + 2, PanelCommand = 201, PauseCommand, ExitCommand, ShortcutCommand };
 enum { ShortcutEnabled = 301, ShortcutShift, ShortcutCtrl, ShortcutAlt, ShortcutWin, ShortcutStep, ShortcutSave, ShortcutDefaults, ShortcutStatus, StartAtLogon };
 struct ShortcutOptions { bool enabled = true; int modifiers = 1; int step = 5; };
-struct WheelRequest { HWND hwnd; DWORD pid, tid; int delta; POINT point; ULONGLONG time; };
+struct WheelRequest { HWND hwnd; DWORD pid, tid; int delta; POINT point; ULONGLONG time; bool toggle = false; };
 static ShortcutOptions shortcut;
 static HWND settingsWindow;
 static HHOOK mouseHook;
+static bool suppressRightUp;
 static std::deque<WheelRequest> wheelRequests;
 static std::wstring settingsPath;
 static ULONGLONG wheelFeedbackUntil;
@@ -81,10 +83,18 @@ static bool IdentityMatches(const SavedWindow& item) {
     return IsWindow(item.hwnd) && pid == item.pid && tid == item.tid &&
         GetPropW(item.hwnd, propertyName) == ownerToken;
 }
+static void CancelTemporary(HWND hwnd) {
+    temporaryOpacity.erase(std::remove_if(temporaryOpacity.begin(), temporaryOpacity.end(), [hwnd](const SavedWindow& item) {
+        return item.hwnd == hwnd;
+    }), temporaryOpacity.end());
+}
 static void Prune() {
     saved.erase(std::remove_if(saved.begin(), saved.end(), [](const SavedWindow& item) {
         return !IdentityMatches(item);
     }), saved.end());
+    temporaryOpacity.erase(std::remove_if(temporaryOpacity.begin(), temporaryOpacity.end(), [](const SavedWindow& item) {
+        return !IdentityMatches(item);
+    }), temporaryOpacity.end());
 }
 static void ErrorMessage(const wchar_t* action, DWORD error) {
     std::wstring message = action;
@@ -98,7 +108,7 @@ static bool SetStyle(HWND hwnd, LONG_PTR style) {
     LONG_PTR previous = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
     return previous != 0 || GetLastError() == 0;
 }
-static bool RestoreWindow(const SavedWindow& item) {
+static bool RestoreAppearance(const SavedWindow& item) {
     if (!IdentityMatches(item)) return true;
     if (item.layered) {
         if (!SetLayeredWindowAttributes(item.hwnd, item.color, item.alpha, item.flags)) return false;
@@ -107,7 +117,12 @@ static bool RestoreWindow(const SavedWindow& item) {
         if (!SetStyle(item.hwnd, style & ~static_cast<LONG_PTR>(WS_EX_LAYERED))) return false;
         RedrawWindow(item.hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
     }
-    RemovePropW(item.hwnd, propertyName);
+    return true;
+}
+static bool RestoreWindow(const SavedWindow& item) {
+    if (!RestoreAppearance(item)) return false;
+    if (IdentityMatches(item)) RemovePropW(item.hwnd, propertyName);
+    CancelTemporary(item.hwnd);
     return true;
 }
 static void ShowPercent(int value) {
@@ -203,6 +218,7 @@ static bool ApplyOpacity(int value, HWND hwnd = nullptr) {
         ErrorMessage(L"设置不透明度", error);
         return false;
     }
+    CancelTemporary(hwnd);
     StatusMessage(L"已应用：不透明度 " + std::to_wstring(value) + L"%。退出本工具时自动恢复。");
     return true;
 }
@@ -521,8 +537,13 @@ static int PressedModifiers() {
     return modifiers;
 }
 static LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
-    if (code == HC_ACTION && wp == WM_MOUSEWHEEL) {
-        if (!shortcut.enabled || PressedModifiers() != shortcut.modifiers || dragging) {
+    if (code == HC_ACTION && wp == WM_RBUTTONUP && suppressRightUp) {
+        suppressRightUp = false;
+        return 1;
+    }
+    if (code == HC_ACTION && (wp == WM_MOUSEWHEEL || wp == WM_RBUTTONDOWN)) {
+        bool wheel = wp == WM_MOUSEWHEEL;
+        if (dragging || (wheel && (!shortcut.enabled || PressedModifiers() != shortcut.modifiers))) {
             wheelPrevious = nullptr;
             wheelRemainder = 0;
             return CallNextHookEx(mouseHook, code, wp, lp);
@@ -532,30 +553,73 @@ static LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
         if (hwnd == popup && IsWindowVisible(popup)) hwnd = popupTarget;
         DWORD pid = 0;
         DWORD tid = GetWindowThreadProcessId(hwnd, &pid);
+        if (!wheel) {
+            bool active = std::any_of(temporaryOpacity.begin(), temporaryOpacity.end(), [hwnd](const SavedWindow& item) {
+                return item.hwnd == hwnd && IdentityMatches(item);
+            });
+            bool pending = std::any_of(wheelRequests.begin(), wheelRequests.end(), [hwnd, pid, tid](const WheelRequest& request) {
+                return request.toggle && request.hwnd == hwnd && request.pid == pid && request.tid == tid;
+            });
+            if (!active && !pending && PressedModifiers() != 1) return CallNextHookEx(mouseHook, code, wp, lp);
+        }
         // Keep this callback short. Window mutation and painting run in the queued handler.
         if (hwnd && pid && pid != GetCurrentProcessId() && IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
             hwnd != GetShellWindow() && hwnd != GetDesktopWindow() && GetWindowTextLengthW(hwnd) &&
             !(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) {
             if (wheelRequests.size() < 64) {
-                wheelRequests.push_back(WheelRequest{hwnd, pid, tid, static_cast<short>(HIWORD(mouse.mouseData)), mouse.pt, GetTickCount64()});
+                wheelRequests.push_back(WheelRequest{hwnd, pid, tid, static_cast<short>(HIWORD(mouse.mouseData)), mouse.pt, GetTickCount64(), !wheel});
                 if (!PostMessageW(mainWindow, WheelMessage, 0, 0)) {
                     wheelRequests.pop_back();
                     return CallNextHookEx(mouseHook, code, wp, lp);
                 }
+                if (!wheel) suppressRightUp = true;
+                return 1;
             }
-            return 1;
         }
     }
     return CallNextHookEx(mouseHook, code, wp, lp);
+}
+static void ProcessToggle(const WheelRequest& request) {
+    Prune();
+    auto it = std::find_if(temporaryOpacity.begin(), temporaryOpacity.end(), [&request](const SavedWindow& item) {
+        return item.hwnd == request.hwnd;
+    });
+    bool restoring = it != temporaryOpacity.end();
+    bool ok;
+    if (restoring) {
+        ok = RestoreAppearance(*it);
+        if (ok) temporaryOpacity.erase(it);
+        else ErrorMessage(L"恢复临时透明度", GetLastError());
+    } else {
+        SavedWindow state{};
+        state.hwnd = request.hwnd; state.pid = request.pid; state.tid = request.tid;
+        state.layered = (GetWindowLongPtrW(request.hwnd, GWL_EXSTYLE) & WS_EX_LAYERED) != 0;
+        state.alpha = 255; state.flags = LWA_ALPHA;
+        if (state.layered && !GetLayeredWindowAttributes(request.hwnd, &state.color, &state.alpha, &state.flags)) {
+            StatusMessage(L"此窗口使用特殊分层渲染，无法安全切换透明度。");
+            ok = false;
+        } else {
+            ok = ApplyOpacity(100, request.hwnd);
+            if (ok) temporaryOpacity.push_back(state);
+        }
+    }
+    std::wstring error = lastStatus;
+    if (!IsWindowVisible(popup) || popupTarget != request.hwnd) OpenPopup(request.hwnd, request.point);
+    popupValue = OpacityOf(request.hwnd);
+    popupHint = ok ? (restoring ? L"已恢复切换前的透明度" : L"临时清晰模式  ·  再右键此窗口恢复") : error;
+    wheelFeedbackUntil = GetTickCount64() + 1200;
+    if (target == request.hwnd) ShowPercent(popupValue);
+    InvalidateRect(popup, nullptr, FALSE);
 }
 static void ProcessWheel() {
     if (wheelRequests.empty()) return;
     WheelRequest request = wheelRequests.front();
     wheelRequests.pop_front();
-    if (!shortcut.enabled) return;
     DWORD pid = 0;
     DWORD tid = GetWindowThreadProcessId(request.hwnd, &pid);
     if (pid != request.pid || tid != request.tid || !Eligible(request.hwnd) || IsIconic(request.hwnd)) return;
+    if (request.toggle) { ProcessToggle(request); return; }
+    if (!shortcut.enabled) return;
     if (wheelPrevious != request.hwnd || wheelPid != pid || wheelTid != tid || request.time - wheelTime > 1000) wheelRemainder = 0;
     wheelPrevious = request.hwnd; wheelPid = pid; wheelTid = tid; wheelTime = request.time;
     wheelRemainder += request.delta;
@@ -726,7 +790,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         Control(L"BUTTON", L"恢复全部窗口", WS_TABSTOP, 209, 365, 170, 38, RestoreAll);
         Control(L"BUTTON", L"软件设置", WS_TABSTOP, 392, 365, 142, 38, ShortcutCommand);
         statusText = Control(L"STATIC", L"", 0, 27, 424, 508, 56, Status);
-        Control(L"STATIC", L"关闭此面板后继续在托盘运行；右键托盘可恢复全部或退出。", 0, 27, 494, 510, 40);
+        Control(L"STATIC", L"Shift + 右键临时切到 100%，再右键恢复。\n关闭面板后继续在托盘运行，右键托盘可退出。", 0, 27, 494, 510, 40);
         RefreshWindows();
         return 0;
     }
