@@ -36,8 +36,8 @@ static double scale = 1;
 static const wchar_t* propertyName = L"WindowOpacity.Owner.8CF3470F";
 static HANDLE ownerToken;
 enum { TrayCallback = WM_APP + 1, WheelMessage = WM_APP + 2, PanelCommand = 201, PauseCommand, ExitCommand, ShortcutCommand,
-    RegionSelectCommand, RegionClearCommand, RegionClearAllCommand };
-static constexpr int RegionSelectHotkey = 6901, RegionClearHotkey = 6902;
+    RegionSelectCommand, RegionClearCommand, RegionClearAllCommand, RegionSettingsCommand };
+static constexpr int RegionSelectHotkey = 6901, RegionClearHotkey = 6902, RegionSettingsHotkey = 6903;
 enum { ShortcutEnabled = 301, ShortcutShift, ShortcutCtrl, ShortcutAlt, ShortcutWin, ShortcutStep, ShortcutSave, ShortcutDefaults, ShortcutStatus, StartAtLogon };
 struct ShortcutOptions { bool enabled = true; int modifiers = 1; int step = 5; };
 struct WheelRequest { HWND hwnd; DWORD pid, tid; int delta; POINT point; ULONGLONG time; bool toggle = false; };
@@ -117,8 +117,9 @@ static bool SetStyle(HWND hwnd, LONG_PTR style) {
 static bool RestoreAppearance(const SavedWindow& item) {
     if (!IdentityMatches(item)) return true;
     if (item.layered) {
-        if (!SetLayeredWindowAttributes(item.hwnd, item.color, item.alpha, item.flags)) return false;
+        if (!ClearRegion::WriteAppearance(item.hwnd, item.color, item.alpha, item.flags)) return false;
     } else {
+        if (ClearRegion::RestoreUnlayered(item.hwnd)) return true;
         LONG_PTR style = GetWindowLongPtrW(item.hwnd, GWL_EXSTYLE);
         if (!SetStyle(item.hwnd, style & ~static_cast<LONG_PTR>(WS_EX_LAYERED))) return false;
         RedrawWindow(item.hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
@@ -149,11 +150,11 @@ static void SelectWindow() {
     LRESULT index = SendMessageW(windowList, CB_GETCURSEL, 0, 0);
     target = index == CB_ERR ? nullptr : reinterpret_cast<HWND>(SendMessageW(windowList, CB_GETITEMDATA, index, 0));
     int value = 100;
-    if (IsWindow(target) && (GetWindowLongPtrW(target, GWL_EXSTYLE) & WS_EX_LAYERED)) {
+    if (IsWindow(target) && ClearRegion::IsLayered(target)) {
         BYTE alpha = 255;
         DWORD flags = 0;
         COLORREF color = 0;
-        if (GetLayeredWindowAttributes(target, &color, &alpha, &flags) && (flags & LWA_ALPHA))
+        if (ClearRegion::ReadAppearance(target, &color, &alpha, &flags) && (flags & LWA_ALPHA))
             value = std::max(1, static_cast<int>((alpha * 100 + 127) / 255));
     }
     ShowPercent(value);
@@ -196,10 +197,10 @@ static bool ApplyOpacity(int value, HWND hwnd = nullptr) {
     if (first) {
         original.hwnd = hwnd;
         original.tid = GetWindowThreadProcessId(hwnd, &original.pid);
-        original.layered = (style & WS_EX_LAYERED) != 0;
+        original.layered = ClearRegion::IsLayered(hwnd);
         original.alpha = 255;
         original.flags = LWA_ALPHA;
-        if (original.layered && !GetLayeredWindowAttributes(hwnd, &original.color, &original.alpha, &original.flags)) {
+        if (original.layered && !ClearRegion::ReadAppearance(hwnd, &original.color, &original.alpha, &original.flags)) {
             StatusMessage(L"此窗口使用特殊的分层渲染，无法安全调整透明度。请选择其他窗口。");
             return false;
         }
@@ -218,7 +219,7 @@ static bool ApplyOpacity(int value, HWND hwnd = nullptr) {
     }
     DWORD flags = LWA_ALPHA | (existing->flags & LWA_COLORKEY);
     BYTE alpha = static_cast<BYTE>((value * 255 + 50) / 100);
-    if (!SetLayeredWindowAttributes(hwnd, existing->color, alpha, flags)) {
+    if (!ClearRegion::WriteAppearance(hwnd, existing->color, alpha, flags)) {
         DWORD error = GetLastError();
         if (first && RestoreWindow(*existing)) saved.pop_back();
         ErrorMessage(L"设置不透明度", error);
@@ -230,7 +231,7 @@ static bool ApplyOpacity(int value, HWND hwnd = nullptr) {
 }
 static int RestoreAllWindows() {
     ClearRegion::ClearAll();
-    int failures = 0;
+    int failures = static_cast<int>(ClearRegion::sources.size());
     for (auto it = saved.begin(); it != saved.end();) {
         if (RestoreWindow(*it)) it = saved.erase(it);
         else { ++failures; ++it; }
@@ -241,8 +242,8 @@ static int OpacityOf(HWND hwnd) {
     COLORREF color = 0;
     BYTE alpha = 255;
     DWORD flags = 0;
-    if ((GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED) &&
-        GetLayeredWindowAttributes(hwnd, &color, &alpha, &flags) && (flags & LWA_ALPHA))
+    if (ClearRegion::IsLayered(hwnd) &&
+        ClearRegion::ReadAppearance(hwnd, &color, &alpha, &flags) && (flags & LWA_ALPHA))
         return std::max(1, static_cast<int>((alpha * 100 + 127) / 255));
     return 100;
 }
@@ -440,8 +441,8 @@ static void DrawPopup(HDC dc) {
     SelectObject(dc, oldPen);
     DeleteObject(rail); DeleteObject(filled); DeleteObject(thumb); DeleteObject(button);
     text(L"恢复", restore, popupTitleFont, RGB(225, 233, 249), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    text(L"框选清晰区域", selectRegion, popupTitleFont, RGB(225, 233, 249), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    text(L"取消清晰", clearRegion, popupTitleFont, RGB(225, 233, 249), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    text(L"添加局部区域", selectRegion, popupTitleFont, RGB(225, 233, 249), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    text(L"区域设置", clearRegion, popupTitleFont, RGB(225, 233, 249), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     text(popupHint.empty() ? L"拖动调整  ·  移开自动收起" : popupHint.c_str(),
         RECT{P(18), P(99), P(332), P(130)}, popupSmallFont,
         popupHint.empty() ? RGB(147, 163, 187) : RGB(255, 191, 135), DT_WORDBREAK);
@@ -478,8 +479,7 @@ static LRESULT CALLBACK PopupProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp)
         RECT selectRegion = PopupSelectRegionRect(), clearRegion = PopupClearRegionRect();
         if (PtInRect(&selectRegion, point)) { BeginRegionSelection(popupTarget); return 0; }
         if (PtInRect(&clearRegion, point)) {
-            popupHint = ClearRegion::Clear(popupTarget) ? L"已取消此窗口的清晰区域" : L"此窗口尚未设置清晰区域";
-            InvalidateRect(hwnd, nullptr, FALSE); return 0;
+            HWND source = popupTarget; HidePopup(); ClearRegion::OpenManager(source); return 0;
         }
         RECT restore = PopupRestoreRect();
         if (PtInRect(&restore, point) && PopupTargetValid()) {
@@ -636,9 +636,9 @@ static void ProcessToggle(const WheelRequest& request) {
     } else {
         SavedWindow state{};
         state.hwnd = request.hwnd; state.pid = request.pid; state.tid = request.tid;
-        state.layered = (GetWindowLongPtrW(request.hwnd, GWL_EXSTYLE) & WS_EX_LAYERED) != 0;
+        state.layered = ClearRegion::IsLayered(request.hwnd);
         state.alpha = 255; state.flags = LWA_ALPHA;
-        if (state.layered && !GetLayeredWindowAttributes(request.hwnd, &state.color, &state.alpha, &state.flags)) {
+        if (state.layered && !ClearRegion::ReadAppearance(request.hwnd, &state.color, &state.alpha, &state.flags)) {
             StatusMessage(L"此窗口使用特殊分层渲染，无法安全切换透明度。");
             ok = false;
         } else {
@@ -848,22 +848,24 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         Control(L"BUTTON", L"恢复所选窗口", WS_TABSTOP, 26, 365, 170, 38, Restore);
         Control(L"BUTTON", L"恢复全部窗口", WS_TABSTOP, 209, 365, 170, 38, RestoreAll);
         Control(L"BUTTON", L"软件设置", WS_TABSTOP, 392, 365, 142, 38, ShortcutCommand);
-        Control(L"BUTTON", L"框选局部清晰", WS_TABSTOP, 26, 414, 245, 34, RegionSelectCommand);
-        Control(L"BUTTON", L"取消所选窗口的清晰区域", WS_TABSTOP, 284, 414, 250, 34, RegionClearCommand);
+        Control(L"BUTTON", L"添加局部区域", WS_TABSTOP, 26, 414, 245, 34, RegionSelectCommand);
+        Control(L"BUTTON", L"局部区域设置（透明度 / 删除）", WS_TABSTOP, 284, 414, 250, 34, RegionSettingsCommand);
         statusText = Control(L"STATIC", L"", 0, 27, 461, 508, 42, Status);
-        Control(L"STATIC", L"Ctrl + Shift + F8 框选局部；Ctrl + Shift + F9 取消。\nShift + 右键临时清晰，再右键恢复；右键托盘可退出。", 0, 27, 518, 510, 44);
+        Control(L"STATIC", L"Ctrl+Shift+F8 添加区域；Ctrl+Shift+F10 调整局部透明度。\nCtrl+Shift+F9 清除本窗口全部区域；右键托盘可退出。", 0, 27, 518, 510, 44);
         RefreshWindows();
         return 0;
     }
     case WheelMessage: ProcessWheel(); return 0;
     case WM_HOTKEY:
         if (wp == RegionSelectHotkey) BeginRegionSelection(PointedSource());
+        else if (wp == RegionSettingsHotkey) { HWND source = PointedSource(); HidePopup(); ClearRegion::OpenManager(source); }
         else if (wp == RegionClearHotkey)
             StatusMessage(ClearRegion::Clear(PointedSource()) ? L"已取消此窗口的清晰区域。" : L"鼠标下的窗口没有清晰区域。");
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case RegionSelectCommand: BeginRegionSelection(target); break;
+        case RegionSettingsCommand: HidePopup(); ClearRegion::OpenManager(target); break;
         case RegionClearCommand:
             StatusMessage(ClearRegion::Clear(target) ? L"已取消所选窗口的清晰区域。" : L"所选窗口没有清晰区域。"); break;
         case RegionClearAllCommand:
@@ -954,6 +956,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     case WM_DESTROY:
         UnregisterHotKey(hwnd, RegionSelectHotkey);
         UnregisterHotKey(hwnd, RegionClearHotkey);
+        UnregisterHotKey(hwnd, RegionSettingsHotkey);
         ClearRegion::ClearAll();
         if (mouseHook) { UnhookWindowsHookEx(mouseHook); mouseHook = nullptr; }
         KillTimer(hwnd, HoverTimer);
@@ -1030,7 +1033,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int show) 
     bool added = AddTray();
     bool regionHotkey = RegisterHotKey(hwnd, RegionSelectHotkey, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F8) != FALSE;
     bool regionClearHotkey = RegisterHotKey(hwnd, RegionClearHotkey, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F9) != FALSE;
-    if (!regionHotkey || !regionClearHotkey)
+    bool regionSettingsHotkey = RegisterHotKey(hwnd, RegionSettingsHotkey, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F10) != FALSE;
+    if (!regionHotkey || !regionClearHotkey || !regionSettingsHotkey)
         StatusMessage(L"局部清晰快捷键被占用。仍可通过顶部菜单或控制面板框选和取消。");
     mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc, instance, 0);
     if (!mouseHook) StatusMessage(L"滚轮快捷键启动失败，请退出后重新运行。顶部菜单仍可使用。");
@@ -1038,7 +1042,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int show) 
     MSG message{};
     int result;
     while ((result = GetMessageW(&message, nullptr, 0, 0)) > 0) {
-        if (!(settingsWindow && IsDialogMessageW(settingsWindow, &message)) && !IsDialogMessageW(hwnd, &message)) {
+        if (!(ClearRegion::manager && IsDialogMessageW(ClearRegion::manager, &message)) &&
+            !(settingsWindow && IsDialogMessageW(settingsWindow, &message)) && !IsDialogMessageW(hwnd, &message)) {
             TranslateMessage(&message); DispatchMessageW(&message);
         }
     }
