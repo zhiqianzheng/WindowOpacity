@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include "clear_region.h"
 
 enum { WindowList = 101, Refresh, Pick, Slider, Percent, Apply, Restore, RestoreAll, Status };
 struct SavedWindow {
@@ -34,7 +35,9 @@ static int countdown;
 static double scale = 1;
 static const wchar_t* propertyName = L"WindowOpacity.Owner.8CF3470F";
 static HANDLE ownerToken;
-enum { TrayCallback = WM_APP + 1, WheelMessage = WM_APP + 2, PanelCommand = 201, PauseCommand, ExitCommand, ShortcutCommand };
+enum { TrayCallback = WM_APP + 1, WheelMessage = WM_APP + 2, PanelCommand = 201, PauseCommand, ExitCommand, ShortcutCommand,
+    RegionSelectCommand, RegionClearCommand, RegionClearAllCommand };
+static constexpr int RegionSelectHotkey = 6901, RegionClearHotkey = 6902;
 enum { ShortcutEnabled = 301, ShortcutShift, ShortcutCtrl, ShortcutAlt, ShortcutWin, ShortcutStep, ShortcutSave, ShortcutDefaults, ShortcutStatus, StartAtLogon };
 struct ShortcutOptions { bool enabled = true; int modifiers = 1; int step = 5; };
 struct WheelRequest { HWND hwnd; DWORD pid, tid; int delta; POINT point; ULONGLONG time; bool toggle = false; };
@@ -57,6 +60,7 @@ static DWORD popupPid, popupTid;
 static HFONT popupFont, popupTitleFont, popupSmallFont;
 static double popupScale = 1;
 static bool dragging, hoverEnabled = true, trayAdded;
+static bool popupInteractive = true;
 static int popupValue = 100, anchorOffset;
 static POINT hoverPoint;
 static ULONGLONG hoverSince, lastInside;
@@ -71,6 +75,8 @@ static void ExitApplication();
 static bool AddTray();
 static void ShowShortcutSettings();
 static void PopupApplyAt(int x);
+static void BeginRegionSelection(HWND source);
+static HWND PointedSource();
 
 static int S(int value) { return static_cast<int>(value * scale + .5); }
 static void StatusMessage(const std::wstring& message) {
@@ -223,6 +229,7 @@ static bool ApplyOpacity(int value, HWND hwnd = nullptr) {
     return true;
 }
 static int RestoreAllWindows() {
+    ClearRegion::ClearAll();
     int failures = 0;
     for (auto it = saved.begin(); it != saved.end();) {
         if (RestoreWindow(*it)) it = saved.erase(it);
@@ -261,7 +268,7 @@ static void PositionPopup() {
     if (!VisibleBounds(popupTarget, bounds)) return;
     MONITORINFO monitor{sizeof(monitor), {}, {}, 0};
     GetMonitorInfoW(MonitorFromWindow(popupTarget, MONITOR_DEFAULTTONEAREST), &monitor);
-    int width = P(350), height = P(132);
+    int width = P(350), height = P(172);
     int x = bounds.left + anchorOffset - width / 2;
     int minX = std::max(static_cast<int>(bounds.left), static_cast<int>(monitor.rcWork.left));
     int maxX = std::min(static_cast<int>(bounds.right), static_cast<int>(monitor.rcWork.right)) - width;
@@ -285,9 +292,15 @@ static void ConfigurePopupDpi(HWND hwnd) {
     popupFont = makeFont(14, FW_SEMIBOLD);
     popupTitleFont = makeFont(12, FW_NORMAL);
     popupSmallFont = makeFont(11, FW_NORMAL);
-    SetWindowRgn(popup, CreateRoundRectRgn(0, 0, P(350)+1, P(132)+1, P(18), P(18)), TRUE);
+    SetWindowRgn(popup, CreateRoundRectRgn(0, 0, P(350)+1, P(172)+1, P(18), P(18)), TRUE);
 }
-static void OpenPopup(HWND hwnd, POINT cursor) {
+static void OpenPopup(HWND hwnd, POINT cursor, bool interactive = true) {
+    popupInteractive = interactive;
+    LONG_PTR style = GetWindowLongPtrW(popup, GWL_EXSTYLE) | WS_EX_LAYERED;
+    if (interactive) style &= ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
+    else style |= WS_EX_TRANSPARENT;
+    SetStyle(popup, style);
+    SetLayeredWindowAttributes(popup, 0, 255, LWA_ALPHA);
     popupTarget = hwnd;
     popupTid = GetWindowThreadProcessId(hwnd, &popupPid);
     RECT bounds{};
@@ -298,6 +311,18 @@ static void OpenPopup(HWND hwnd, POINT cursor) {
     popupHint.clear();
     lastInside = GetTickCount64();
     PositionPopup();
+    RECT shown{};
+    GetWindowRect(popup, &shown);
+    if (PtInRect(&shown, cursor)) {
+        MONITORINFO monitor{sizeof(monitor), {}, {}, 0};
+        GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &monitor);
+        int height = shown.bottom-shown.top;
+        int y = cursor.y + P(14);
+        if (y + height > monitor.rcWork.bottom) y = cursor.y - height - P(14);
+        y = std::clamp(y, static_cast<int>(monitor.rcWork.top),
+            std::max(static_cast<int>(monitor.rcWork.top), static_cast<int>(monitor.rcWork.bottom)-height));
+        SetWindowPos(popup, HWND_TOPMOST, shown.left, y, shown.right-shown.left, height, SWP_NOACTIVATE);
+    }
     InvalidateRect(popup, nullptr, FALSE);
 }
 static bool AtTopEdge(HWND hwnd, POINT point) {
@@ -312,16 +337,21 @@ static bool AtTopEdge(HWND hwnd, POINT point) {
         point.y >= bounds.top && point.y < bounds.top + S(12);
 }
 static void HoverTick() {
+    ClearRegion::Tick();
     if (!trayAdded && GetTickCount64() >= trayRetryAt) {
         trayRetryAt = GetTickCount64() + 5000;
         AddTray();
     }
-    if ((!hoverEnabled && GetTickCount64() >= wheelFeedbackUntil) || countdown) { HidePopup(); return; }
+    if (ClearRegion::selector || (!hoverEnabled && GetTickCount64() >= wheelFeedbackUntil) || countdown) { HidePopup(); return; }
     POINT point{};
     if (!GetCursorPos(&point)) { HidePopup(); return; }
     ULONGLONG now = GetTickCount64();
     if (IsWindowVisible(popup)) {
         if (!PopupTargetValid()) { HidePopup(); return; }
+        if (!popupInteractive) {
+            if (now >= wheelFeedbackUntil) HidePopup();
+            return;
+        }
         if (dragging) {
             POINT local = point;
             ScreenToClient(popup, &local);
@@ -366,6 +396,8 @@ static void HoverTick() {
     if (now - hoverSince >= 320) OpenPopup(candidate, point);
 }
 static RECT PopupRestoreRect() { return RECT{P(268), P(61), P(332), P(91)}; }
+static RECT PopupSelectRegionRect() { return RECT{P(18), P(134), P(218), P(162)}; }
+static RECT PopupClearRegionRect() { return RECT{P(228), P(134), P(332), P(162)}; }
 static void DrawPopup(HDC dc) {
     RECT client{};
     GetClientRect(popup, &client);
@@ -401,10 +433,15 @@ static void DrawPopup(HDC dc) {
     SelectObject(dc, button);
     RECT restore = PopupRestoreRect();
     RoundRect(dc, restore.left, restore.top, restore.right, restore.bottom, P(10), P(10));
+    RECT selectRegion = PopupSelectRegionRect(), clearRegion = PopupClearRegionRect();
+    RoundRect(dc, selectRegion.left, selectRegion.top, selectRegion.right, selectRegion.bottom, P(10), P(10));
+    RoundRect(dc, clearRegion.left, clearRegion.top, clearRegion.right, clearRegion.bottom, P(10), P(10));
     SelectObject(dc, oldBrush);
     SelectObject(dc, oldPen);
     DeleteObject(rail); DeleteObject(filled); DeleteObject(thumb); DeleteObject(button);
     text(L"恢复", restore, popupTitleFont, RGB(225, 233, 249), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    text(L"框选清晰区域", selectRegion, popupTitleFont, RGB(225, 233, 249), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    text(L"取消清晰", clearRegion, popupTitleFont, RGB(225, 233, 249), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     text(popupHint.empty() ? L"拖动调整  ·  移开自动收起" : popupHint.c_str(),
         RECT{P(18), P(99), P(332), P(130)}, popupSmallFont,
         popupHint.empty() ? RGB(147, 163, 187) : RGB(255, 191, 135), DT_WORDBREAK);
@@ -438,6 +475,12 @@ static LRESULT CALLBACK PopupProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN: {
         POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         if (point.x >= P(314) && point.y < P(36)) { HidePopup(); return 0; }
+        RECT selectRegion = PopupSelectRegionRect(), clearRegion = PopupClearRegionRect();
+        if (PtInRect(&selectRegion, point)) { BeginRegionSelection(popupTarget); return 0; }
+        if (PtInRect(&clearRegion, point)) {
+            popupHint = ClearRegion::Clear(popupTarget) ? L"已取消此窗口的清晰区域" : L"此窗口尚未设置清晰区域";
+            InvalidateRect(hwnd, nullptr, FALSE); return 0;
+        }
         RECT restore = PopupRestoreRect();
         if (PtInRect(&restore, point) && PopupTargetValid()) {
             Prune();
@@ -604,7 +647,7 @@ static void ProcessToggle(const WheelRequest& request) {
         }
     }
     std::wstring error = lastStatus;
-    if (!IsWindowVisible(popup) || popupTarget != request.hwnd) OpenPopup(request.hwnd, request.point);
+    if (!IsWindowVisible(popup) || popupTarget != request.hwnd || popupInteractive) OpenPopup(request.hwnd, request.point, false);
     popupValue = OpacityOf(request.hwnd);
     popupHint = ok ? (restoring ? L"已恢复切换前的透明度" : L"临时清晰模式  ·  再右键此窗口恢复") : error;
     wheelFeedbackUntil = GetTickCount64() + 1200;
@@ -630,7 +673,7 @@ static void ProcessWheel() {
     int value = std::clamp(before + ticks * shortcut.step, 1, 100);
     bool ok = value == before || ApplyOpacity(value, request.hwnd);
     std::wstring error = lastStatus;
-    if (!IsWindowVisible(popup) || popupTarget != request.hwnd) OpenPopup(request.hwnd, request.point);
+    if (!IsWindowVisible(popup) || popupTarget != request.hwnd || popupInteractive) OpenPopup(request.hwnd, request.point, false);
     popupValue = OpacityOf(request.hwnd);
     popupHint = ok ? L"上滚更清晰  ·  下滚更透明" : error;
     wheelFeedbackUntil = GetTickCount64() + 1000;
@@ -742,6 +785,22 @@ static void ShowPanel() {
     ShowWindow(mainWindow, SW_RESTORE);
     SetForegroundWindow(mainWindow);
 }
+static HWND PointedSource() {
+    POINT cursor{};
+    if (!GetCursorPos(&cursor)) return nullptr;
+    HWND source = GetAncestor(WindowFromPoint(cursor), GA_ROOT);
+    if (source == popup && IsWindowVisible(popup)) return popupTarget;
+    return ClearRegion::SourceForOverlay(source);
+}
+static void BeginRegionSelection(HWND source) {
+    if (!ClearRegion::CanSelect(source)) {
+        StatusMessage(L"请将鼠标指向目标窗口，按 Ctrl + Shift + F8 框选清晰区域。"); return;
+    }
+    HidePopup();
+    if (IsWindowVisible(mainWindow)) ShowWindow(mainWindow, SW_HIDE);
+    SetForegroundWindow(source);
+    ClearRegion::Begin(source);
+}
 static void ExitApplication() {
     HidePopup();
     if (RestoreAllWindows()) {
@@ -789,14 +848,26 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         Control(L"BUTTON", L"恢复所选窗口", WS_TABSTOP, 26, 365, 170, 38, Restore);
         Control(L"BUTTON", L"恢复全部窗口", WS_TABSTOP, 209, 365, 170, 38, RestoreAll);
         Control(L"BUTTON", L"软件设置", WS_TABSTOP, 392, 365, 142, 38, ShortcutCommand);
-        statusText = Control(L"STATIC", L"", 0, 27, 424, 508, 56, Status);
-        Control(L"STATIC", L"Shift + 右键临时切到 100%，再右键恢复。\n关闭面板后继续在托盘运行，右键托盘可退出。", 0, 27, 494, 510, 40);
+        Control(L"BUTTON", L"框选局部清晰", WS_TABSTOP, 26, 414, 245, 34, RegionSelectCommand);
+        Control(L"BUTTON", L"取消所选窗口的清晰区域", WS_TABSTOP, 284, 414, 250, 34, RegionClearCommand);
+        statusText = Control(L"STATIC", L"", 0, 27, 461, 508, 42, Status);
+        Control(L"STATIC", L"Ctrl + Shift + F8 框选局部；Ctrl + Shift + F9 取消。\nShift + 右键临时清晰，再右键恢复；右键托盘可退出。", 0, 27, 518, 510, 44);
         RefreshWindows();
         return 0;
     }
     case WheelMessage: ProcessWheel(); return 0;
+    case WM_HOTKEY:
+        if (wp == RegionSelectHotkey) BeginRegionSelection(PointedSource());
+        else if (wp == RegionClearHotkey)
+            StatusMessage(ClearRegion::Clear(PointedSource()) ? L"已取消此窗口的清晰区域。" : L"鼠标下的窗口没有清晰区域。");
+        return 0;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
+        case RegionSelectCommand: BeginRegionSelection(target); break;
+        case RegionClearCommand:
+            StatusMessage(ClearRegion::Clear(target) ? L"已取消所选窗口的清晰区域。" : L"所选窗口没有清晰区域。"); break;
+        case RegionClearAllCommand:
+            ClearRegion::ClearAll(); StatusMessage(L"已取消所有清晰区域。"); break;
         case ShortcutCommand: ShowShortcutSettings(); break;
         case PanelCommand: ShowPanel(); break;
         case PauseCommand:
@@ -862,6 +933,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
             AppendMenuW(menu, MF_STRING, ShortcutCommand, L"设置（滚轮幅度 / 开机启动）…");
             AppendMenuW(menu, MF_STRING | (hoverEnabled ? MF_CHECKED : MF_UNCHECKED), PauseCommand, L"启用顶部悬停菜单");
             AppendMenuW(menu, MF_STRING, RestoreAll, L"恢复全部窗口");
+            AppendMenuW(menu, MF_STRING, RegionClearAllCommand, L"取消所有局部清晰区域");
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(menu, MF_STRING, ExitCommand, L"退出并恢复全部窗口");
             POINT point{}; GetCursorPos(&point);
@@ -880,6 +952,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         else ExitApplication();
         return 0;
     case WM_DESTROY:
+        UnregisterHotKey(hwnd, RegionSelectHotkey);
+        UnregisterHotKey(hwnd, RegionClearHotkey);
+        ClearRegion::ClearAll();
         if (mouseHook) { UnhookWindowsHookEx(mouseHook); mouseHook = nullptr; }
         KillTimer(hwnd, HoverTimer);
         HidePopup();
@@ -937,8 +1012,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int show) 
     settingsClass.lpfnWndProc = SettingsProc;
     settingsClass.lpszClassName = L"WindowOpacity.Settings";
     if (!RegisterClassW(&settingsClass)) { CloseHandle(mutex); return 1; }
+    if (!ClearRegion::Initialize(instance, StatusMessage)) { CloseHandle(mutex); return 1; }
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT rect{0, 0, S(560), S(544)};
+    RECT rect{0, 0, S(560), S(574)};
     AdjustWindowRectEx(&rect, style, FALSE, 0);
     HWND hwnd = CreateWindowExW(0, cls.lpszClassName, L"窗口透明度 · WindowOpacity", style,
         CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top,
@@ -952,6 +1028,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int show) 
         DestroyWindow(hwnd); CloseHandle(mutex); return 1;
     }
     bool added = AddTray();
+    bool regionHotkey = RegisterHotKey(hwnd, RegionSelectHotkey, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F8) != FALSE;
+    bool regionClearHotkey = RegisterHotKey(hwnd, RegionClearHotkey, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F9) != FALSE;
+    if (!regionHotkey || !regionClearHotkey)
+        StatusMessage(L"局部清晰快捷键被占用。仍可通过顶部菜单或控制面板框选和取消。");
     mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc, instance, 0);
     if (!mouseHook) StatusMessage(L"滚轮快捷键启动失败，请退出后重新运行。顶部菜单仍可使用。");
     if (!background && (!added || !mouseHook || wcsstr(commandLine, L"--panel"))) ShowWindow(hwnd, show);
