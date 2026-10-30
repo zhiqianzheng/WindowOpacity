@@ -38,8 +38,8 @@ static HANDLE ownerToken;
 enum { TrayCallback = WM_APP + 1, WheelMessage = WM_APP + 2, PanelCommand = 201, PauseCommand, ExitCommand, ShortcutCommand,
     RegionSelectCommand, RegionClearCommand, RegionClearAllCommand, RegionSettingsCommand };
 static constexpr int RegionSelectHotkey = 6901, RegionClearHotkey = 6902, RegionSettingsHotkey = 6903;
-enum { ShortcutEnabled = 301, ShortcutShift, ShortcutCtrl, ShortcutAlt, ShortcutWin, ShortcutStep, ShortcutSave, ShortcutDefaults, ShortcutStatus, StartAtLogon };
-struct ShortcutOptions { bool enabled = true; int modifiers = 1; int step = 5; };
+enum { ShortcutEnabled = 301, ShortcutShift, ShortcutCtrl, ShortcutAlt, ShortcutWin, ShortcutStep, ShortcutSave, ShortcutDefaults, ShortcutStatus, StartAtLogon, ShortcutBacktick };
+struct ShortcutOptions { bool enabled = true; int modifiers = 16; int step = 5; };
 struct WheelRequest { HWND hwnd; DWORD pid, tid; int delta; POINT point; ULONGLONG time; bool toggle = false; };
 static ShortcutOptions shortcut;
 static HWND settingsWindow;
@@ -74,6 +74,7 @@ static void ShowPanel();
 static void ExitApplication();
 static bool AddTray();
 static void ShowShortcutSettings();
+static bool SaveSettings(const ShortcutOptions& options);
 static void PopupApplyAt(int x);
 static void BeginRegionSelection(HWND source);
 static HWND PointedSource();
@@ -519,15 +520,21 @@ static void LoadSettings() {
     CreateDirectoryW(folder.c_str(), nullptr);
     settingsPath = folder + L"\\settings.ini";
     shortcut.enabled = GetPrivateProfileIntW(L"Shortcut", L"Enabled", 1, settingsPath.c_str()) != 0;
-    int modifiers = static_cast<int>(GetPrivateProfileIntW(L"Shortcut", L"Modifiers", 1, settingsPath.c_str()));
+    int modifiers = static_cast<int>(GetPrivateProfileIntW(L"Shortcut", L"Modifiers", 16, settingsPath.c_str()));
     int step = static_cast<int>(GetPrivateProfileIntW(L"Shortcut", L"Step", 5, settingsPath.c_str()));
-    shortcut.modifiers = modifiers >= 1 && modifiers <= 15 ? modifiers : 1;
+    shortcut.modifiers = modifiers >= 1 && modifiers <= 31 ? modifiers : 16;
     shortcut.step = step >= 1 && step <= 100 ? step : 5;
+    // Upgrade the old Shift-only default without changing custom combinations,
+    // the wheel step, enabled state, or the independent Windows startup entry.
+    if (GetPrivateProfileIntW(L"Shortcut", L"BindingVersion", 1, settingsPath.c_str()) < 2) {
+        if (shortcut.modifiers == 1) shortcut.modifiers = 16;
+        SaveSettings(shortcut);
+    }
 }
 static bool SaveSettings(const ShortcutOptions& options) {
     if (settingsPath.empty()) return false;
     std::wstring content = L"\xFEFF[Shortcut]\r\nEnabled=" + std::to_wstring(options.enabled ? 1 : 0) +
-        L"\r\nModifiers=" + std::to_wstring(options.modifiers) + L"\r\nStep=" + std::to_wstring(options.step) + L"\r\n";
+        L"\r\nModifiers=" + std::to_wstring(options.modifiers) + L"\r\nStep=" + std::to_wstring(options.step) + L"\r\nBindingVersion=2\r\n";
     std::wstring temporary = settingsPath + L".tmp";
     HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
@@ -577,6 +584,9 @@ static int PressedModifiers() {
     if (GetAsyncKeyState(VK_CONTROL) & 0x8000) modifiers |= 2;
     if (GetAsyncKeyState(VK_MENU) & 0x8000) modifiers |= 4;
     if ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) modifiers |= 8;
+    // VK_OEM_3 is the ` / · key in English and Chinese input modes;
+    // its down state is independent of the character produced by the IME.
+    if (GetAsyncKeyState(VK_OEM_3) & 0x8000) modifiers |= 16;
     return modifiers;
 }
 static LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
@@ -684,6 +694,7 @@ static void FillShortcutSettings(const ShortcutOptions& options) {
     CheckDlgButton(settingsWindow, ShortcutEnabled, options.enabled ? BST_CHECKED : BST_UNCHECKED);
     for (int i = 0; i < 4; ++i)
         CheckDlgButton(settingsWindow, ShortcutShift + i, (options.modifiers & (1 << i)) ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(settingsWindow, ShortcutBacktick, (options.modifiers & 16) ? BST_CHECKED : BST_UNCHECKED);
     SetDlgItemInt(settingsWindow, ShortcutStep, options.step, FALSE);
 }
 static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
@@ -701,10 +712,11 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wp, LPARAM 
         };
         control(L"STATIC", L"鼠标指向窗口，按住组合键并滚动", 0, 24, 20, 392, 26);
         control(L"BUTTON", L"启用滚轮调节透明度", BS_AUTOCHECKBOX | WS_TABSTOP, 24, 60, 380, 28, ShortcutEnabled);
-        control(L"STATIC", L"按住的组合键（可多选，至少一项）", 0, 24, 107, 390, 24);
+        control(L"STATIC", L"默认按住 · / ` 键（Esc 下方），可多选", 0, 24, 107, 390, 24);
         const wchar_t* names[] = {L"Shift", L"Ctrl", L"Alt", L"Win"};
         for (int i = 0; i < 4; ++i)
-            control(L"BUTTON", names[i], BS_AUTOCHECKBOX | WS_TABSTOP, 24 + 96*i, 140, 90, 28, ShortcutShift+i);
+            control(L"BUTTON", names[i], BS_AUTOCHECKBOX | WS_TABSTOP, 24 + 78*i, 140, 76, 28, ShortcutShift+i);
+        control(L"BUTTON", L"· / `", BS_AUTOCHECKBOX | WS_TABSTOP, 336, 140, 78, 28, ShortcutBacktick);
         control(L"STATIC", L"每格透明度变化", 0, 24, 193, 155, 26);
         HWND edit = control(L"EDIT", L"", WS_BORDER | ES_NUMBER | ES_CENTER | WS_TABSTOP, 182, 190, 60, 30, ShortcutStep);
         SendMessageW(edit, EM_SETLIMITTEXT, 3, 0);
@@ -729,6 +741,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wp, LPARAM 
             options.modifiers = 0;
             for (int i = 0; i < 4; ++i)
                 if (IsDlgButtonChecked(hwnd, ShortcutShift+i) == BST_CHECKED) options.modifiers |= 1 << i;
+            if (IsDlgButtonChecked(hwnd, ShortcutBacktick) == BST_CHECKED) options.modifiers |= 16;
             BOOL valid = FALSE;
             options.step = static_cast<int>(GetDlgItemInt(hwnd, ShortcutStep, &valid, FALSE));
             if (!options.modifiers || !valid || options.step < 1 || options.step > 100) {
@@ -775,7 +788,7 @@ static bool AddTray() {
     data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     data.uCallbackMessage = TrayCallback;
     data.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    lstrcpynW(data.szTip, L"窗口透明度：顶部悬停菜单 / 组合键 + 滚轮\n右键可设置快捷键", ARRAYSIZE(data.szTip));
+    lstrcpynW(data.szTip, L"窗口透明度：顶部悬停菜单 / · 或 ` 键 + 滚轮\n右键可设置快捷键", ARRAYSIZE(data.szTip));
     trayAdded = Shell_NotifyIconW(NIM_ADD, &data) != FALSE;
     return trayAdded;
 }
@@ -830,7 +843,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
         HWND heading = Control(L"STATIC", L"窗口透明度", 0, 26, 21, 480, 38);
         SendMessageW(heading, WM_SETFONT, reinterpret_cast<WPARAM>(headingFont), TRUE);
-        Control(L"STATIC", L"支持顶部悬停菜单，或使用组合键 + 鼠标滚轮调节。", 0, 27, 66, 510, 24);
+        Control(L"STATIC", L"按住 · / ` 键（Esc 下方）+ 滚轮调节，也可顶部悬停。", 0, 27, 66, 510, 24);
         Control(L"STATIC", L"目标窗口", 0, 27, 112, 200, 24);
         windowList = Control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 26, 142, 508, 260, WindowList);
         SendMessageW(windowList, CB_SETDROPPEDWIDTH, S(680), 0);
