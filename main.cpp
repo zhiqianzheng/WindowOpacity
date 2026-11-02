@@ -16,6 +16,7 @@
 #include <vector>
 #include <deque>
 #include "clear_region.h"
+#include "startup_task.h"
 
 enum { WindowList = 101, Refresh, Pick, Slider, Percent, Apply, Restore, RestoreAll, Status };
 struct SavedWindow {
@@ -551,32 +552,26 @@ static std::wstring StartupCommand() {
     if (!length || length >= path.size()) return L"";
     return L"\"" + std::wstring(path.data(), length) + L"\" --background";
 }
-static bool StartsAtLogon() {
+static bool LegacyStartsAtLogon() {
     wchar_t value[32768] = {};
     DWORD size = sizeof(value);
     if (RegGetValueW(HKEY_CURRENT_USER, runKey, runValue, RRF_RT_REG_SZ, nullptr, value, &size) != ERROR_SUCCESS) return false;
     std::wstring expected = StartupCommand();
     return !expected.empty() && expected == value;
 }
-static LSTATUS SetStartAtLogon(bool enabled) {
-    if (!enabled) {
-        HKEY key = nullptr;
-        LSTATUS result = RegOpenKeyExW(HKEY_CURRENT_USER, runKey, 0, KEY_SET_VALUE, &key);
-        if (result == ERROR_FILE_NOT_FOUND) return ERROR_SUCCESS;
-        if (result != ERROR_SUCCESS) return result;
-        result = RegDeleteValueW(key, runValue);
-        RegCloseKey(key);
-        return result == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : result;
-    }
-    std::wstring command = StartupCommand();
-    if (command.empty() || command.size() >= 260) return ERROR_FILENAME_EXCED_RANGE;
-    HKEY key = nullptr;
-    LSTATUS result = RegCreateKeyExW(HKEY_CURRENT_USER, runKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr);
+static bool StartsAtLogon() { return StartupTask::Enabled() || LegacyStartsAtLogon(); }
+static LSTATUS RemoveLegacyStartup() {
+    HKEY key{};
+    LSTATUS result = RegOpenKeyExW(HKEY_CURRENT_USER,runKey,0,KEY_SET_VALUE,&key);
+    if (result == ERROR_FILE_NOT_FOUND) return ERROR_SUCCESS;
     if (result != ERROR_SUCCESS) return result;
-    result = RegSetValueExW(key, runValue, 0, REG_SZ, reinterpret_cast<const BYTE*>(command.c_str()),
-        static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
-    RegCloseKey(key);
-    return result;
+    result = RegDeleteValueW(key,runValue); RegCloseKey(key);
+    return result == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : result;
+}
+static LSTATUS SetStartAtLogon(bool enabled) {
+    HRESULT result = StartupTask::Configure(enabled);
+    if (FAILED(result)) return HRESULT_FACILITY(result) == FACILITY_WIN32 ? HRESULT_CODE(result) : static_cast<LSTATUS>(result);
+    return RemoveLegacyStartup();
 }
 static int PressedModifiers() {
     int modifiers = 0;
@@ -723,7 +718,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wp, LPARAM 
         control(L"STATIC", L"%（1–100）", 0, 254, 193, 155, 26);
         control(L"STATIC", L"可直接输入整数，例如 1%、3%、10%；保存后立即生效。", 0, 24, 232, 392, 44);
         control(L"BUTTON", L"开机自启动（登录后在托盘后台运行）", BS_AUTOCHECKBOX | WS_TABSTOP, 24, 291, 392, 30, StartAtLogon);
-        control(L"STATIC", L"不弹出控制面板；取消勾选并保存即可关闭自启动。", 0, 24, 330, 392, 46);
+        control(L"STATIC", L"登录后延迟 10 秒启动；异常退出每分钟重试，最多 3 次。", 0, 24, 330, 392, 46);
         control(L"BUTTON", L"恢复默认", WS_TABSTOP, 24, 393, 128, 36, ShortcutDefaults);
         control(L"BUTTON", L"保存设置", WS_TABSTOP | BS_DEFPUSHBUTTON, 270, 393, 145, 36, ShortcutSave);
         control(L"STATIC", L"", 0, 24, 445, 392, 50, ShortcutStatus);
@@ -755,7 +750,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wp, LPARAM 
                 LSTATUS result = SetStartAtLogon(autoStart);
                 if (result == ERROR_SUCCESS) {
                     SetDlgItemTextW(hwnd, ShortcutStatus, autoStart ?
-                        L"设置已保存。下次登录 Windows 后自动在托盘运行。" : L"设置已保存并立即生效，重启后仍然保留。");
+                        L"设置已保存。下次登录后延迟 10 秒在托盘运行，异常退出可自动重试。" : L"设置已保存并立即生效，重启后仍然保留。");
                 } else {
                     std::wstring error = L"滚轮设置已保存；自启动设置失败（错误 " + std::to_wstring(result) + L"）。";
                     SetDlgItemTextW(hwnd, ShortcutStatus, error.c_str());
@@ -992,6 +987,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     return DefWindowProcW(hwnd, message, wp, lp);
 }
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int show) {
+    if (wcsstr(commandLine,L"--startup-supervisor")) return StartupTask::Supervise();
     bool background = wcsstr(commandLine, L"--background") != nullptr;
     SetProcessDPIAware();
     HDC dc = GetDC(nullptr);
@@ -1007,6 +1003,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int show) 
     }
     ownerToken = reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(GetCurrentProcessId()));
     LoadSettings();
+    // Upgrade existing logon startup only after the scheduled task registers.
+    // Keep the Run entry intact if registration fails.
+    LSTATUS startupUpgrade = (LegacyStartsAtLogon() || (StartupTask::Enabled(true) && !StartupTask::Enabled())) ?
+        SetStartAtLogon(true) : ERROR_SUCCESS;
     taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&controls);
@@ -1044,6 +1044,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int show) 
         DestroyWindow(hwnd); CloseHandle(mutex); return 1;
     }
     bool added = AddTray();
+    if (startupUpgrade != ERROR_SUCCESS)
+        StatusMessage(L"自启动升级未完成，旧启动项已保留。请在软件设置中重新保存开机自启动。");
     bool regionHotkey = RegisterHotKey(hwnd, RegionSelectHotkey, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F8) != FALSE;
     bool regionClearHotkey = RegisterHotKey(hwnd, RegionClearHotkey, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F9) != FALSE;
     bool regionSettingsHotkey = RegisterHotKey(hwnd, RegionSettingsHotkey, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F10) != FALSE;
