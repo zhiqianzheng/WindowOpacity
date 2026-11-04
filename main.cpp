@@ -601,15 +601,9 @@ static LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
         if (hwnd == popup && IsWindowVisible(popup)) hwnd = popupTarget;
         DWORD pid = 0;
         DWORD tid = GetWindowThreadProcessId(hwnd, &pid);
-        if (!wheel) {
-            bool active = std::any_of(temporaryOpacity.begin(), temporaryOpacity.end(), [hwnd](const SavedWindow& item) {
-                return item.hwnd == hwnd && IdentityMatches(item);
-            });
-            bool pending = std::any_of(wheelRequests.begin(), wheelRequests.end(), [hwnd, pid, tid](const WheelRequest& request) {
-                return request.toggle && request.hwnd == hwnd && request.pid == pid && request.tid == tid;
-            });
-            if (!active && !pending && PressedModifiers() != 1) return CallNextHookEx(mouseHook, code, wp, lp);
-        }
+        // Both directions of the temporary-opacity toggle require Shift.
+        // An active temporary state must never consume an ordinary context click.
+        if (!wheel && PressedModifiers() != 1) return CallNextHookEx(mouseHook, code, wp, lp);
         // Keep this callback short. Window mutation and painting run in the queued handler.
         if (hwnd && pid && pid != GetCurrentProcessId() && IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
             hwnd != GetShellWindow() && hwnd != GetDesktopWindow() && GetWindowTextLengthW(hwnd) &&
@@ -654,7 +648,7 @@ static void ProcessToggle(const WheelRequest& request) {
     std::wstring error = lastStatus;
     if (!IsWindowVisible(popup) || popupTarget != request.hwnd || popupInteractive) OpenPopup(request.hwnd, request.point, false);
     popupValue = OpacityOf(request.hwnd);
-    popupHint = ok ? (restoring ? L"已恢复切换前的透明度" : L"临时清晰模式  ·  再右键此窗口恢复") : error;
+    popupHint = ok ? (restoring ? L"已恢复切换前的透明度" : L"临时清晰模式  ·  再按 Shift + 右键恢复") : error;
     wheelFeedbackUntil = GetTickCount64() + 1200;
     if (target == request.hwnd) ShowPercent(popupValue);
     InvalidateRect(popup, nullptr, FALSE);
